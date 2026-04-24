@@ -1,8 +1,9 @@
-"""Streamlit chat UI for CV question answering with RAG (Pinecone + OpenAI/Groq)."""
+"""Streamlit chat UI for CV question answering with multi-agent RAG."""
 
 from __future__ import annotations
 
 import os
+import re
 from typing import List
 
 import streamlit as st
@@ -10,20 +11,18 @@ from dotenv import load_dotenv
 
 from rag.chunker import chunk_text
 from rag.llm import (
-    LLMError,
     PROVIDER_GROQ,
     PROVIDER_OPENAI,
     available_providers,
-    generate,
 )
 from rag.loader import SUPPORTED_EXTENSIONS, UnsupportedFileTypeError, extract_text
+from rag.multi_agent import AgentRegistry, MultiAgentOrchestrator
 from rag.pinecone_store import (
     PineconeStore,
     PineconeUnauthorized,
     RetrievedChunk,
     namespace_for,
 )
-from rag.prompts import SYSTEM_PROMPT, build_search_query, build_user_prompt
 
 
 load_dotenv()
@@ -38,13 +37,24 @@ def get_store() -> PineconeStore:
 
 def _init_state() -> None:
     st.session_state.setdefault("messages", [])
-    st.session_state.setdefault("namespace", None)
-    st.session_state.setdefault("cv_filename", None)
-    st.session_state.setdefault("num_chunks", 0)
-    st.session_state.setdefault("uploaded_hash", None)
+    st.session_state.setdefault("agent_registry", AgentRegistry())
 
 
-def _ingest_cv(store: PineconeStore, file_bytes: bytes, filename: str) -> None:
+def _person_prefix(person_name: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", person_name.strip().lower())
+    slug = re.sub(r"_+", "_", slug).strip("_") or "person"
+    return f"cv_{slug}"
+
+
+def _ingest_cv(
+    store: PineconeStore,
+    registry: AgentRegistry,
+    file_bytes: bytes,
+    filename: str,
+    person_name: str,
+    aliases_csv: str,
+    set_as_default: bool,
+) -> None:
     try:
         text = extract_text(file_bytes, filename)
     except UnsupportedFileTypeError as exc:
@@ -60,12 +70,12 @@ def _ingest_cv(store: PineconeStore, file_bytes: bytes, filename: str) -> None:
         st.error("The CV produced no chunks after splitting.")
         return
 
-    namespace = namespace_for(file_bytes)
+    namespace = namespace_for(file_bytes, prefix=_person_prefix(person_name))
 
     if store.namespace_exists(namespace):
         st.info(
-            f"This CV is already indexed (namespace `{namespace}`). "
-            "Skipping re-upload."
+            f"{person_name}'s CV is already indexed (namespace `{namespace}`). "
+            "Skipping re-upload and refreshing the agent mapping."
         )
     else:
         try:
@@ -79,29 +89,67 @@ def _ingest_cv(store: PineconeStore, file_bytes: bytes, filename: str) -> None:
             )
             return
 
-    st.session_state.namespace = namespace
-    st.session_state.cv_filename = filename
-    st.session_state.num_chunks = len(chunks)
-    st.session_state.uploaded_hash = namespace
+    aliases = AgentRegistry.aliases_from_csv(aliases_csv)
+    spec = registry.register(
+        person_name=person_name,
+        namespace=namespace,
+        source_filename=filename,
+        aliases=aliases,
+        set_as_default=set_as_default,
+    )
     st.session_state.messages = []
-    st.success(f"CV ready. Ask questions about **{filename}**.")
+    st.success(
+        f"CV ready for **{spec.display_name}**. "
+        f"Namespace: `{spec.namespace}`. Ask questions in chat."
+    )
 
 
 def _render_sidebar(store: PineconeStore) -> str:
+    registry: AgentRegistry = st.session_state.agent_registry
+
     with st.sidebar:
-        st.header("CV RAG")
-        st.caption("Upload a CV and ask questions grounded on its contents.")
+        st.header("Multi-CV RAG")
+        st.caption(
+            "Upload one CV per person. Queries are routed to the right CV agent."
+        )
+
+        person_name = st.text_input(
+            "Person name",
+            placeholder="e.g., Juan Perez",
+            help="Name used by the router to detect mentions in questions.",
+        )
+        aliases_csv = st.text_input(
+            "Aliases (optional, comma-separated)",
+            placeholder="e.g., Juan, Juancito",
+        )
+        set_as_default = st.checkbox(
+            "Set as default (student CV)",
+            value=(registry.default_agent() is None),
+            help=(
+                "When a question mentions no person, the default CV agent is used."
+            ),
+        )
 
         uploaded = st.file_uploader(
-            "Upload CV",
+            "Upload CV file",
             type=[ext.lstrip(".") for ext in SUPPORTED_EXTENSIONS],
             accept_multiple_files=False,
         )
-        if uploaded is not None:
-            file_bytes = uploaded.getvalue()
-            new_hash = namespace_for(file_bytes)
-            if new_hash != st.session_state.get("uploaded_hash"):
-                _ingest_cv(store, file_bytes, uploaded.name)
+        if st.button("Index / update CV", use_container_width=True):
+            if uploaded is None:
+                st.warning("Upload a CV file first.")
+            elif not person_name.strip():
+                st.warning("Provide the person's name before indexing.")
+            else:
+                _ingest_cv(
+                    store=store,
+                    registry=registry,
+                    file_bytes=uploaded.getvalue(),
+                    filename=uploaded.name,
+                    person_name=person_name.strip(),
+                    aliases_csv=aliases_csv,
+                    set_as_default=set_as_default,
+                )
 
         st.divider()
 
@@ -134,12 +182,39 @@ def _render_sidebar(store: PineconeStore) -> str:
 
         st.subheader("Status")
         st.write(f"Index: `{store.index_name}`")
-        if st.session_state.namespace:
-            st.write(f"CV: **{st.session_state.cv_filename}**")
-            st.write(f"Namespace: `{st.session_state.namespace}`")
-            st.write(f"Chunks: {st.session_state.num_chunks}")
+        agents = registry.list_agents()
+        if not agents:
+            st.info("Upload at least one CV to start.")
         else:
-            st.info("Upload a CV to start.")
+            st.write(f"Registered agents: **{len(agents)}**")
+            default_id = registry.default_agent_id()
+            options = {a.display_name: a.person_id for a in agents}
+            name_list = list(options.keys())
+            default_index = 0
+            if default_id:
+                for idx, name in enumerate(name_list):
+                    if options[name] == default_id:
+                        default_index = idx
+                        break
+            selected_name = st.selectbox(
+                "Default agent",
+                options=name_list,
+                index=default_index,
+            )
+            selected_id = options[selected_name]
+            if selected_id != default_id:
+                registry.set_default_agent(selected_id)
+                st.rerun()
+
+            for agent in agents:
+                is_default = agent.person_id == registry.default_agent_id()
+                label = f"**{agent.display_name}**"
+                if is_default:
+                    label += " (default)"
+                st.markdown(label)
+                st.caption(
+                    f"Namespace: `{agent.namespace}` | Source: `{agent.source_filename}`"
+                )
 
         if st.button("Clear chat", use_container_width=True):
             st.session_state.messages = []
@@ -153,10 +228,6 @@ def _render_sidebar(store: PineconeStore) -> str:
             "the app was running.",
         ):
             get_store.clear()
-            st.session_state.namespace = None
-            st.session_state.cv_filename = None
-            st.session_state.num_chunks = 0
-            st.session_state.uploaded_hash = None
             st.session_state.messages = []
             st.rerun()
 
@@ -181,24 +252,28 @@ def _render_history() -> None:
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            chunks = msg.get("chunks")
-            if chunks:
-                with st.expander(f"Retrieved context ({len(chunks)} chunks)"):
+            agent_results = msg.get("agent_results") or []
+            for result in agent_results:
+                agent_name = result["agent_name"]
+                chunks = result["chunks"]
+                with st.expander(
+                    f"{agent_name} context ({len(chunks)} chunks)"
+                ):
                     _render_chunks(chunks)
 
 
 def _answer(store: PineconeStore, provider: str, question: str) -> None:
-    namespace = st.session_state.namespace
-    if not namespace:
-        st.warning("Upload a CV before asking questions.")
+    registry: AgentRegistry = st.session_state.agent_registry
+    if not registry.list_agents():
+        st.warning("Upload at least one CV before asking questions.")
         return
 
     prior = st.session_state.messages[:-1]
+    orchestrator = MultiAgentOrchestrator(store=store, registry=registry)
     with st.chat_message("assistant"):
         try:
-            with st.spinner("Searching CV..."):
-                search_q = build_search_query(question, prior)
-                chunks = store.search(namespace, search_q, top_k=5, rerank=True)
+            with st.spinner("Routing and retrieving context..."):
+                result = orchestrator.answer(question, provider=provider, prior_messages=prior)
         except PineconeUnauthorized:
             st.error(
                 "Pinecone returned 401 Unauthorized. The index may have been "
@@ -206,37 +281,52 @@ def _answer(store: PineconeStore, provider: str, question: str) -> None:
             )
             return
 
-        user_prompt = build_user_prompt(question, chunks, prior_messages=prior)
-
-        try:
-            with st.spinner("Generating answer..."):
-                response = generate(SYSTEM_PROMPT, user_prompt, provider=provider)
-        except LLMError as exc:
-            st.error(str(exc))
-            return
-        except Exception as exc:
-            st.error(f"LLM call failed: {exc}")
+        response = result.response
+        if response.model == "n/a":
+            st.warning(response.text)
             return
 
         if response.fallback_used and response.fallback_reason:
             st.warning(response.fallback_reason)
 
+        route = result.route
+        routed_names = ", ".join(a.display_name for a in route.selected_agents)
+        if routed_names:
+            mode_label = "default route" if route.used_default else "explicit route"
+            st.caption(f"Route ({mode_label}): {routed_names}")
+            st.caption(route.reason)
+
         st.markdown(response.text)
         st.caption(f"Answered with {response.provider} ({response.model})")
-        with st.expander(f"Retrieved context ({len(chunks)} chunks)"):
-            _render_chunks(chunks)
+
+        serialized_agent_results = []
+        for agent_result in result.agent_results:
+            with st.expander(
+                f"{agent_result.agent.display_name} context ({len(agent_result.chunks)} chunks)"
+            ):
+                _render_chunks(agent_result.chunks)
+            serialized_agent_results.append(
+                {
+                    "agent_name": agent_result.agent.display_name,
+                    "chunks": agent_result.chunks,
+                }
+            )
 
         st.session_state.messages.append(
-            {"role": "assistant", "content": response.text, "chunks": chunks}
+            {
+                "role": "assistant",
+                "content": response.text,
+                "agent_results": serialized_agent_results,
+            }
         )
 
 
 def main() -> None:
     _init_state()
 
-    st.title("CV RAG Chatbot")
+    st.title("Multi-Agent CV RAG Chatbot")
     st.caption(
-        "Retrieval-Augmented Generation over a single CV — "
+        "One CV agent per person, routed by query mentions, using "
         "Streamlit + Pinecone (llama-text-embed-v2) + OpenAI/Groq."
     )
 
@@ -255,9 +345,9 @@ def main() -> None:
     _render_history()
 
     question = st.chat_input(
-        "Ask a question about the CV..."
-        if st.session_state.namespace
-        else "Upload a CV in the sidebar first..."
+        "Ask about one person or compare multiple people..."
+        if st.session_state.agent_registry.list_agents()
+        else "Upload at least one CV in the sidebar first..."
     )
     if question:
         st.session_state.messages.append({"role": "user", "content": question})

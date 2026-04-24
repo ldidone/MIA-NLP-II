@@ -1,7 +1,7 @@
-# CV RAG Chatbot
+# Multi-Agent CV RAG Chatbot
 
-Practical Assignment #2 — A Retrieval-Augmented Generation chatbot that answers
-questions about an uploaded CV.
+Practical Assignment #2 — A Retrieval-Augmented Generation chatbot that supports
+one CV agent per person and routes each question to the correct CV context.
 
 - **UI**: Streamlit
 - **Vector DB**: Pinecone with integrated embeddings (`llama-text-embed-v2`)
@@ -10,53 +10,52 @@ questions about an uploaded CV.
   (`llama-3.3-70b-versatile`)
 - **Document loaders**: PDF, DOCX, TXT
 
+## Routing behavior
+
+- If the query mentions one person, route to that person's CV agent.
+- If the query mentions multiple people, retrieve from all matching CV agents and
+  synthesize a combined answer.
+- If no person is mentioned, route to the default CV agent (student CV).
+- If retrieved context is insufficient, the assistant must say the information is
+  not available in the CV.
+- Answers must be grounded in retrieved context (no hallucinated facts).
+
 ## Architecture
 
 ```mermaid
 flowchart TD
-    User --> UI[Streamlit Chat UI]
+    A[User] --> B[Streamlit UI]
+    B --> C[Agent Controller]
 
-    subgraph Ingestion
-        direction TB
-        Upload[CV Upload\nPDF / DOCX / TXT]
-        Upload --> Loader[Loader\nextract & preserve blank lines]
-        Loader --> Chunker
+    C --> D{Decision Node:<br/>Which CV agent(s) should answer?}
 
-        subgraph Chunker[Semantic Chunker]
-            direction TB
-            CH1[Detect section headers\nEDUCATION · EXPERIENCE · SKILLS …]
-            CH2[Split body into entries\nat blank lines]
-            CH3[Pack entries into chunks ≤ 500 chars\nheading injected into every chunk]
-            CH4[Char-window fallback\nfor oversized entries]
-            CH1 --> CH2 --> CH3 --> CH4
-        end
+    D -->|One person detected| E[Route to one CVAgent]
+    D -->|Multiple people detected| F[Route to multiple CVAgents]
+    D -->|No person detected| G[Route to default student CVAgent]
 
-        Chunker --> Upsert[Upsert to Pinecone\nauto-reconnect on 401]
-        Upsert --> Pinecone[(Pinecone Index\nllama-text-embed-v2)]
+    subgraph Vector Storage Layer
+        VDB[(Single Pinecone Index)]
+        N1[Namespace: person A]
+        N2[Namespace: person B]
+        N3[Namespace: person C]
     end
 
-    subgraph Runtime
-        direction TB
-        UI --> Q[User question]
-        Q --> QExp[Query expansion\nlast 4 turns prepended]
-        QExp --> Search[Vector search + rerank\nbge-reranker-v2-m3]
-        Search --> Pinecone
-        Pinecone --> Ctx[Top-K chunks]
-        Ctx --> Prompt
+    E --> VDB
+    F --> VDB
+    G --> VDB
 
-        subgraph Prompt[Prompt builder]
-            direction TB
-            PM[Prior messages\nlast 12 turns]
-            PC[CV context\nnumbered chunks]
-            PQ[Current question]
-            PM --> Assemble
-            PC --> Assemble
-            PQ --> Assemble[Assembled prompt]
-        end
+    E -. scoped to .-> N1
+    F -. scoped to .-> N2
+    F -. scoped to .-> N3
+    G -. scoped to .-> N1
 
-        Prompt --> LLM[LLM\nOpenAI · Groq fallback]
-        LLM --> UI
-    end
+    VDB --> I[Top-K relevant chunks]
+    I --> J[Prompt Builder / Synthesizer]
+    C --> K[Conversation Memory]
+    K --> J
+    J --> L[LLM]
+    L --> M[Response]
+    M --> B
 ```
 
 ## Setup
@@ -68,7 +67,7 @@ flowchart TD
    pip install -r requirements.txt
    ```
 
-2. Configure `.env` (already contains `PINECONE_API_KEY` and `GROQ_API_KEY`):
+2. Configure `.env`:
 
    ```env
    PINECONE_API_KEY=your_pinecone_key
@@ -82,60 +81,54 @@ flowchart TD
 ## Run
 
 ```bash
-# Recommended: invoke the venv's streamlit directly so pyenv shims don't take over
 .venv/bin/streamlit run app.py
-
-# Equivalent alternatives:
-#   .venv/bin/python -m streamlit run app.py
-#   source .venv/bin/activate && hash -r && streamlit run app.py
 ```
 
-> If you see `ModuleNotFoundError: No module named 'docx'` (or similar) after
-> `pip install -r requirements.txt`, it almost always means `streamlit` was
-> resolved to a pyenv/global shim instead of the venv. Use one of the commands
-> above. Verify with `which streamlit` — it should point to `.venv/bin/streamlit`.
+If `streamlit` resolves to a global shim, use:
 
-Then in the browser:
+```bash
+.venv/bin/python -m streamlit run app.py
+```
 
-1. Upload a CV (PDF, DOCX, or TXT) from the sidebar.
-2. Wait for indexing (the index is auto-created on first run).
-3. Ask questions in the chat input — the chatbot remembers the conversation.
+## How to use
 
-Each assistant reply has an expandable "Retrieved context" panel showing the
-chunks fetched from Pinecone, their scores, and chunk indices.
+1. In the sidebar, fill:
+   - **Person name**
+   - **Aliases** (optional, comma-separated)
+   - **Set as default (student CV)** for the fallback agent
+2. Upload a CV file (`pdf`, `docx`, `txt`) and click **Index / update CV**.
+3. Repeat for each person.
+4. Ask questions in chat (individual or comparative).
+
+Each assistant message includes expandable retrieved context per selected agent.
+
+## Suggested test queries
+
+- `What experience does Juan have?`
+- `Tell me about Maria's education.`
+- `Compare Juan and Maria in terms of Python experience.`
+- `Who has more experience with machine learning?`
+- `What projects has this person worked on?` (should use default agent)
 
 ## Project layout
 
-```
-app.py                # Streamlit entrypoint
+```text
+app.py                # Streamlit entrypoint (UI + orchestration wiring)
 rag/
   __init__.py
   loader.py           # PDF / DOCX / TXT extraction; preserves blank lines
   chunker.py          # Semantic CV chunker: section-aware, heading-injected chunks
-  pinecone_store.py   # Idempotent index bootstrap, upsert, search + rerank;
-                      # auto-reconnect on 401 (stale cached index handle)
+  pinecone_store.py   # Pinecone index bootstrap, upsert, namespace search + rerank
   llm.py              # OpenAI / Groq abstraction with automatic fallback
-  prompts.py          # Prompt builder with conversation history injection
+  prompts.py          # Prompt builder for single-agent CV answering
+  multi_agent.py      # AgentRegistry, CVRouter, CVAgent, synthesizer, orchestrator
 requirements.txt
 .env                  # API keys (gitignored)
 ```
 
 ## Notes
 
-- Each uploaded CV gets its own Pinecone namespace derived from a SHA-1 of its
-  bytes (`cv_<hash>`), so re-uploading the same file is a no-op.
-- The Pinecone index is created on first launch using
-  `create_index_for_model(model="llama-text-embed-v2", field_map={text: content})`
-  on `aws/us-east-1`. No manual setup needed.
+- The system uses one Pinecone index with one namespace per person/CV.
 - Search retrieves `top_k * 2` candidates and reranks with `bge-reranker-v2-m3`.
-- After upsert, the app waits 10 seconds before allowing the first query to
-  ensure consistency.
-- **Conversation memory**: the last 12 turns are injected into the prompt so the
-  model can handle follow-up questions. The last 4 turns are also prepended to the
-  vector search query to improve recall for pronoun/reference resolution.
-- **Semantic chunking**: the chunker detects CV section headers (ALL-CAPS or
-  ~30 known title-case headings) and injects the heading into every chunk, so
-  retrieval always returns self-contained, contextualised excerpts.
-- **Stale index recovery**: if you delete the Pinecone index while the app is
-  running, operations auto-retry once after refreshing the index handle. A manual
-  **Reconnect to Pinecone** button is also available in the sidebar.
+- Conversation memory is used for follow-up disambiguation.
+- If the Pinecone index is deleted while running, use **Reconnect to Pinecone**.

@@ -1,0 +1,7 @@
+streamlit
+pinecone
+python-dotenv
+pypdf
+python-docx
+openai
+groq

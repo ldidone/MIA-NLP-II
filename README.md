@@ -15,13 +15,47 @@ questions about an uploaded CV.
 ```mermaid
 flowchart TD
     User --> UI[Streamlit Chat UI]
+
     subgraph Ingestion
-        Upload[CV Upload<br/>PDF/DOCX/TXT] --> Loader --> Chunker --> Upsert
-        Upsert --> Pinecone[(Pinecone Index<br/>llama-text-embed-v2)]
+        direction TB
+        Upload[CV Upload\nPDF / DOCX / TXT]
+        Upload --> Loader[Loader\nextract & preserve blank lines]
+        Loader --> Chunker
+
+        subgraph Chunker[Semantic Chunker]
+            direction TB
+            CH1[Detect section headers\nEDUCATION · EXPERIENCE · SKILLS …]
+            CH2[Split body into entries\nat blank lines]
+            CH3[Pack entries into chunks ≤ 500 chars\nheading injected into every chunk]
+            CH4[Char-window fallback\nfor oversized entries]
+            CH1 --> CH2 --> CH3 --> CH4
+        end
+
+        Chunker --> Upsert[Upsert to Pinecone\nauto-reconnect on 401]
+        Upsert --> Pinecone[(Pinecone Index\nllama-text-embed-v2)]
     end
+
     subgraph Runtime
-        UI --> Q[Question] --> Search --> Pinecone
-        Search --> Ctx[Top-K Chunks] --> Prompt --> LLM --> UI
+        direction TB
+        UI --> Q[User question]
+        Q --> QExp[Query expansion\nlast 4 turns prepended]
+        QExp --> Search[Vector search + rerank\nbge-reranker-v2-m3]
+        Search --> Pinecone
+        Pinecone --> Ctx[Top-K chunks]
+        Ctx --> Prompt
+
+        subgraph Prompt[Prompt builder]
+            direction TB
+            PM[Prior messages\nlast 12 turns]
+            PC[CV context\nnumbered chunks]
+            PQ[Current question]
+            PM --> Assemble
+            PC --> Assemble
+            PQ --> Assemble[Assembled prompt]
+        end
+
+        Prompt --> LLM[LLM\nOpenAI · Groq fallback]
+        LLM --> UI
     end
 ```
 
@@ -65,7 +99,7 @@ Then in the browser:
 
 1. Upload a CV (PDF, DOCX, or TXT) from the sidebar.
 2. Wait for indexing (the index is auto-created on first run).
-3. Ask questions in the chat input.
+3. Ask questions in the chat input — the chatbot remembers the conversation.
 
 Each assistant reply has an expandable "Retrieved context" panel showing the
 chunks fetched from Pinecone, their scores, and chunk indices.
@@ -76,11 +110,12 @@ chunks fetched from Pinecone, their scores, and chunk indices.
 app.py                # Streamlit entrypoint
 rag/
   __init__.py
-  loader.py           # PDF / DOCX / TXT text extraction
-  chunker.py          # sliding-window chunker (~800 chars, 100 overlap)
-  pinecone_store.py   # idempotent index bootstrap, upsert, search + rerank
+  loader.py           # PDF / DOCX / TXT extraction; preserves blank lines
+  chunker.py          # Semantic CV chunker: section-aware, heading-injected chunks
+  pinecone_store.py   # Idempotent index bootstrap, upsert, search + rerank;
+                      # auto-reconnect on 401 (stale cached index handle)
   llm.py              # OpenAI / Groq abstraction with automatic fallback
-  prompts.py          # system + user prompt templates
+  prompts.py          # Prompt builder with conversation history injection
 requirements.txt
 .env                  # API keys (gitignored)
 ```
@@ -95,3 +130,12 @@ requirements.txt
 - Search retrieves `top_k * 2` candidates and reranks with `bge-reranker-v2-m3`.
 - After upsert, the app waits 10 seconds before allowing the first query to
   ensure consistency.
+- **Conversation memory**: the last 12 turns are injected into the prompt so the
+  model can handle follow-up questions. The last 4 turns are also prepended to the
+  vector search query to improve recall for pronoun/reference resolution.
+- **Semantic chunking**: the chunker detects CV section headers (ALL-CAPS or
+  ~30 known title-case headings) and injects the heading into every chunk, so
+  retrieval always returns self-contained, contextualised excerpts.
+- **Stale index recovery**: if you delete the Pinecone index while the app is
+  running, operations auto-retry once after refreshing the index handle. A manual
+  **Reconnect to Pinecone** button is also available in the sidebar.

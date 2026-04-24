@@ -13,7 +13,7 @@ from typing_extensions import TypedDict
 
 from .llm import LLMResponse, generate
 from .pinecone_store import PineconeStore, RetrievedChunk
-from .prompts import SYSTEM_PROMPT, build_search_query, build_user_prompt
+from .prompts import build_search_query, build_user_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -100,8 +100,17 @@ class AgentRegistry:
             raise ValueError("person_name cannot be empty.")
 
         provided_aliases = [a.strip() for a in (aliases or []) if a and a.strip()]
+
+        # Auto-expand a multi-word name into first-name and last-name aliases
+        # so "Lucas" matches "Lucas Didone" without explicit alias configuration.
+        name_parts = clean_name.split()
+        auto_parts: List[str] = []
+        if len(name_parts) > 1:
+            auto_parts.append(name_parts[0])   # first name
+            auto_parts.append(name_parts[-1])  # last name
+
         all_aliases: List[str] = []
-        for alias in [clean_name, *provided_aliases]:
+        for alias in [clean_name, *auto_parts, *provided_aliases]:
             if alias.lower() not in {x.lower() for x in all_aliases}:
                 all_aliases.append(alias)
 
@@ -168,14 +177,23 @@ class CVRouter:
 
     def route(self, query: str) -> RouteDecision:
         matched = self.registry.find_agents_in_query(query)
-        if matched:
-            if len(matched) == 1:
-                reason = f"Detected person mention: {matched[0].display_name}"
-            else:
-                names = ", ".join(a.display_name for a in matched)
-                reason = f"Detected multiple people: {names}"
-            return RouteDecision(selected_agents=matched, used_default=False, reason=reason)
 
+        if len(matched) == 1:
+            return RouteDecision(
+                selected_agents=matched,
+                used_default=False,
+                reason=f"Detected person mention: {matched[0].display_name}",
+            )
+
+        if len(matched) > 1:
+            names = ", ".join(a.display_name for a in matched)
+            return RouteDecision(
+                selected_agents=matched,
+                used_default=False,
+                reason=f"Detected multiple people: {names}",
+            )
+
+        # No name recognised — fall back to the default agent.
         default_agent = self.registry.default_agent()
         if default_agent is None:
             return RouteDecision(
@@ -222,13 +240,6 @@ class RetrieveInput(TypedDict):
 # Graph node functions
 # ---------------------------------------------------------------------------
 
-_SYNTHESIZER_SYSTEM = (
-    "You are a CV comparison assistant. Use ONLY the retrieved CV context from "
-    "the listed people. Do not invent facts. If context is insufficient for any "
-    "part of the question, explicitly say the CVs do not contain that information. "
-    "For comparisons, mention each person separately before concluding. "
-    "Answer in the same language as the user's question."
-)
 
 
 def route_query(state: GraphState) -> dict:
@@ -279,39 +290,85 @@ def collect_results(state: GraphState) -> dict:
     return {}
 
 
+def _filter_prior_for_agent(
+    prior_messages: List[dict], agent_name: str
+) -> List[dict]:
+    """Return only message pairs whose assistant turn used `agent_name`.
+
+    Each (user, assistant) pair is kept only when the assistant message's
+    agent_results contain the requested agent. This prevents context from
+    exchanges about other candidates leaking into the current answer.
+    """
+    if not prior_messages:
+        return []
+    result: List[dict] = []
+    i = 0
+    while i < len(prior_messages):
+        msg = prior_messages[i]
+        if msg.get("role") == "user" and i + 1 < len(prior_messages):
+            nxt = prior_messages[i + 1]
+            if nxt.get("role") == "assistant":
+                used = {r.get("agent_name") for r in (nxt.get("agent_results") or [])}
+                if agent_name in used:
+                    result.append(msg)
+                    result.append(nxt)
+                i += 2
+                continue
+        i += 1
+    return result
+
+
+_SYNTHESIZER_SYSTEM = (
+    "You are a CV comparison assistant. Use ONLY the retrieved CV context from "
+    "the listed people. Do not invent facts. If context is insufficient for any "
+    "part of the question, explicitly say the CV does not contain that information. "
+    "For multi-person answers, address each person separately before concluding. "
+    "Answer in the same language as the user's question."
+)
+
+
 def generate_response(state: GraphState) -> dict:
     """Node: produce the final LLM answer from retrieved context."""
     question = state["question"]
     provider = state["provider"]
-    prior = state["prior_messages"]
+    prior = state["prior_messages"] or []
     agent_results: List[AgentResult] = state.get("agent_results") or []
     selected = state.get("selected_agents") or []
 
-    if len(selected) <= 1:
-        spec = selected[0] if selected else None
-        name = spec.display_name if spec else "the candidate"
+    if len(selected) == 1:
+        spec = selected[0]
+        name = spec.display_name
         chunks = agent_results[0].chunks if agent_results else []
-        scoped_question = f"Question about {name}: {question}"
-        user_prompt = build_user_prompt(
-            scoped_question,
-            chunks,
-            prior_messages=prior or [],
+
+        # Keep only history turns that were about this specific candidate.
+        filtered_prior = _filter_prior_for_agent(prior, name)
+
+        system_prompt = (
+            f"You are a helpful assistant answering questions exclusively about "
+            f"{name}'s CV. Ground every fact in the provided CV context. "
+            "Do not use or reference information about any other person. "
+            "If the answer is not in the CV context, say the CV does not contain it. "
+            "Be concise, factual, and cite context numbers like [1], [2] when useful. "
+            "Answer in the same language as the question."
         )
-        resp = generate(SYSTEM_PROMPT, user_prompt, provider=provider)
+        user_prompt = build_user_prompt(question, chunks, prior_messages=filtered_prior)
+        resp = generate(system_prompt, user_prompt, provider=provider)
+
     else:
+        # Multi-person: fan-in all retrieved contexts and synthesise together.
         context = _format_multi_context(agent_results)
         history_block = _format_history_block(prior)
         user_prompt = (
-            "Use the multi-person CV context to answer the question.\n\n"
+            "Use the multi-person CV context below to answer the question.\n\n"
             f"{history_block}"
             "=== MULTI-CV CONTEXT ===\n"
             f"{context}\n"
             "=== END CONTEXT ===\n\n"
             f"Question: {question}\n\n"
             "Rules:\n"
-            "- Ground all claims in the context.\n"
-            "- If missing, say the CV(s) do not contain that information.\n"
-            "- For comparisons, make the basis of comparison explicit.\n"
+            "- Ground all claims in the context above.\n"
+            "- Address each person separately.\n"
+            "- If information is missing for someone, say their CV does not contain it.\n"
         )
         resp = generate(_SYNTHESIZER_SYSTEM, user_prompt, provider=provider)
 
@@ -325,14 +382,12 @@ def generate_response(state: GraphState) -> dict:
 def _format_multi_context(agent_results: List[AgentResult]) -> str:
     if not agent_results:
         return "(no context retrieved)"
-
     sections: List[str] = []
     for result in agent_results:
         person = result.agent.display_name
         if not result.chunks:
             sections.append(f"### {person}\n(no context retrieved for this CV)")
             continue
-
         chunk_lines: List[str] = []
         for idx, chunk in enumerate(result.chunks, start=1):
             chunk_lines.append(

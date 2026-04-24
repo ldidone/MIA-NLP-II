@@ -27,7 +27,7 @@ flowchart TD
     A[User] --> B[Streamlit UI]
     B --> C[Agent Controller]
 
-    C --> D{Decision Node:<br/>Which CV agent(s) should answer?}
+    C --> D{"Decision Node:\nWhich CV agent(s) should answer?"}
 
     D -->|One person detected| E[Route to one CVAgent]
     D -->|Multiple people detected| F[Route to multiple CVAgents]

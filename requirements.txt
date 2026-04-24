@@ -5,3 +5,4 @@ pypdf
 python-docx
 openai
 groq
+langgraph

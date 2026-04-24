@@ -16,7 +16,7 @@ from rag.llm import (
     available_providers,
 )
 from rag.loader import SUPPORTED_EXTENSIONS, UnsupportedFileTypeError, extract_text
-from rag.multi_agent import AgentRegistry, MultiAgentOrchestrator
+from rag.multi_agent import AgentRegistry, run_graph
 from rag.pinecone_store import (
     PineconeStore,
     PineconeUnauthorized,
@@ -269,11 +269,16 @@ def _answer(store: PineconeStore, provider: str, question: str) -> None:
         return
 
     prior = st.session_state.messages[:-1]
-    orchestrator = MultiAgentOrchestrator(store=store, registry=registry)
     with st.chat_message("assistant"):
         try:
             with st.spinner("Routing and retrieving context..."):
-                result = orchestrator.answer(question, provider=provider, prior_messages=prior)
+                result = run_graph(
+                    question=question,
+                    provider=provider,
+                    prior_messages=prior,
+                    store=store,
+                    registry=registry,
+                )
         except PineconeUnauthorized:
             st.error(
                 "Pinecone returned 401 Unauthorized. The index may have been "

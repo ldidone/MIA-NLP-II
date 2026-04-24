@@ -4,6 +4,7 @@ Practical Assignment #2 — A Retrieval-Augmented Generation chatbot that suppor
 one CV agent per person and routes each question to the correct CV context.
 
 - **UI**: Streamlit
+- **Agent framework**: LangGraph (`StateGraph` with conditional edges and `Send` fan-out)
 - **Vector DB**: Pinecone with integrated embeddings (`llama-text-embed-v2`)
 - **Reranker**: `bge-reranker-v2-m3`
 - **LLM**: OpenAI GPT (default, `gpt-4o-mini`) with automatic fallback to Groq
@@ -20,42 +21,35 @@ one CV agent per person and routes each question to the correct CV context.
   not available in the CV.
 - Answers must be grounded in retrieved context (no hallucinated facts).
 
-## Architecture
+## Architecture (LangGraph StateGraph)
+
+The orchestration pipeline is modelled as a LangGraph `StateGraph`. Each step
+is an explicit node; routing uses conditional edges with dynamic fan-out via
+the `Send` API so that N agents are queried in parallel.
 
 ```mermaid
 flowchart TD
-    A[User] --> B[Streamlit UI]
-    B --> C[Agent Controller]
+    startNode["START"] --> RouteQuery["route_query\n(CVRouter)"]
 
-    C --> D{"Decision Node:\nWhich CV agent(s) should answer?"}
+    RouteQuery -->|"no agents registered"| NoAgents["no_agents_response"]
+    RouteQuery -->|"Send per matched agent"| RetrieveCV["retrieve_cv\n(fan-out, 1 per CV)"]
 
-    D -->|One person detected| E[Route to one CVAgent]
-    D -->|Multiple people detected| F[Route to multiple CVAgents]
-    D -->|No person detected| G[Route to default student CVAgent]
+    RetrieveCV --> GenerateResponse["generate_response\n(single or multi-CV prompt)"]
 
-    subgraph Vector Storage Layer
-        VDB[(Single Pinecone Index)]
-        N1[Namespace: person A]
-        N2[Namespace: person B]
-        N3[Namespace: person C]
+    NoAgents --> endNode["END"]
+    GenerateResponse --> endNode
+
+    subgraph VectorStorage ["Vector Storage Layer"]
+        VDB[("Pinecone Index\nllama-text-embed-v2")]
+        N1["Namespace: person A"]
+        N2["Namespace: person B"]
+        N3["Namespace: person C"]
     end
 
-    E --> VDB
-    F --> VDB
-    G --> VDB
-
-    E -. scoped to .-> N1
-    F -. scoped to .-> N2
-    F -. scoped to .-> N3
-    G -. scoped to .-> N1
-
-    VDB --> I[Top-K relevant chunks]
-    I --> J[Prompt Builder / Synthesizer]
-    C --> K[Conversation Memory]
-    K --> J
-    J --> L[LLM]
-    L --> M[Response]
-    M --> B
+    RetrieveCV -. "scoped search" .-> VDB
+    VDB -.- N1
+    VDB -.- N2
+    VDB -.- N3
 ```
 
 ## Setup
@@ -121,7 +115,7 @@ rag/
   pinecone_store.py   # Pinecone index bootstrap, upsert, namespace search + rerank
   llm.py              # OpenAI / Groq abstraction with automatic fallback
   prompts.py          # Prompt builder for single-agent CV answering
-  multi_agent.py      # AgentRegistry, CVRouter, CVAgent, synthesizer, orchestrator
+  multi_agent.py      # AgentRegistry, CVRouter, LangGraph StateGraph, run_graph()
 requirements.txt
 .env                  # API keys (gitignored)
 ```

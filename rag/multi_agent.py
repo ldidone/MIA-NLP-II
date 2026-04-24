@@ -1,15 +1,24 @@
-"""Multi-agent orchestration for CV-specific RAG answering."""
+"""Multi-agent orchestration for CV-specific RAG answering using LangGraph."""
 
 from __future__ import annotations
 
+import operator
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Annotated, Any, Dict, List, Optional, Sequence
+
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
+from typing_extensions import TypedDict
 
 from .llm import LLMResponse, generate
 from .pinecone_store import PineconeStore, RetrievedChunk
 from .prompts import SYSTEM_PROMPT, build_search_query, build_user_prompt
 
+
+# ---------------------------------------------------------------------------
+# Domain data classes (unchanged)
+# ---------------------------------------------------------------------------
 
 def _slugify(value: str) -> str:
     normalized = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().lower())
@@ -59,6 +68,10 @@ class OrchestrationResult:
     route: RouteDecision
     agent_results: List[AgentResult]
 
+
+# ---------------------------------------------------------------------------
+# AgentRegistry & CVRouter (unchanged domain logic)
+# ---------------------------------------------------------------------------
 
 class AgentRegistry:
     """In-memory registry mapping people/aliases to their CV agents."""
@@ -167,109 +180,109 @@ class CVRouter:
         )
 
 
-class CVAgent:
-    """Retrieval and answer generation for a single CV/person."""
+# ---------------------------------------------------------------------------
+# LangGraph state schema
+# ---------------------------------------------------------------------------
 
-    def __init__(self, store: PineconeStore, spec: AgentSpec) -> None:
-        self.store = store
-        self.spec = spec
+class GraphState(TypedDict):
+    question: str
+    provider: str
+    prior_messages: List[dict]
+    store: Any
+    registry: Any
+    selected_agents: List[AgentSpec]
+    route_decision: Optional[RouteDecision]
+    agent_results: Annotated[List[AgentResult], operator.add]
+    response: Optional[LLMResponse]
 
-    def retrieve(
-        self,
-        question: str,
-        prior_messages: Optional[List[dict]] = None,
-        top_k: int = 5,
-    ) -> AgentResult:
-        search_q = build_search_query(question, prior_messages or [])
-        chunks = self.store.search(
-            namespace=self.spec.namespace,
-            question=search_q,
-            top_k=top_k,
-            rerank=True,
-        )
-        return AgentResult(agent=self.spec, search_query=search_q, chunks=chunks)
 
-    def answer(
-        self,
-        question: str,
-        provider: str,
-        prior_messages: Optional[List[dict]] = None,
-        top_k: int = 5,
-    ) -> OrchestrationResult:
-        retrieval = self.retrieve(question, prior_messages=prior_messages, top_k=top_k)
-        scoped_question = f"Question about {self.spec.display_name}: {question}"
+class RetrieveInput(TypedDict):
+    """Per-branch state sent to retrieve_cv via Send."""
+    question: str
+    provider: str
+    prior_messages: List[dict]
+    store: Any
+    registry: Any
+    selected_agents: List[AgentSpec]
+    route_decision: Optional[RouteDecision]
+    agent_results: Annotated[List[AgentResult], operator.add]
+    response: Optional[LLMResponse]
+    agent_spec: AgentSpec
+
+
+# ---------------------------------------------------------------------------
+# Graph node functions
+# ---------------------------------------------------------------------------
+
+_SYNTHESIZER_SYSTEM = (
+    "You are a CV comparison assistant. Use ONLY the retrieved CV context from "
+    "the listed people. Do not invent facts. If context is insufficient for any "
+    "part of the question, explicitly say the CVs do not contain that information. "
+    "For comparisons, mention each person separately before concluding. "
+    "Answer in the same language as the user's question."
+)
+
+
+def route_query(state: GraphState) -> dict:
+    """Node: detect which person(s) are mentioned and decide routing."""
+    registry: AgentRegistry = state["registry"]
+    router = CVRouter(registry)
+    decision = router.route(state["question"])
+    return {
+        "route_decision": decision,
+        "selected_agents": decision.selected_agents,
+    }
+
+
+def no_agents_response(state: GraphState) -> dict:
+    """Node: early-exit when no CV agents are registered."""
+    return {
+        "response": LLMResponse(
+            text="No CV agents are registered yet. Upload at least one CV to continue.",
+            provider=state["provider"],
+            model="n/a",
+        ),
+    }
+
+
+def retrieve_cv(state: RetrieveInput) -> dict:
+    """Node: retrieve top-k chunks from one CV agent's namespace."""
+    spec: AgentSpec = state["agent_spec"]
+    store: PineconeStore = state["store"]
+    question = state["question"]
+    prior = state["prior_messages"]
+
+    search_q = build_search_query(question, prior or [])
+    chunks = store.search(
+        namespace=spec.namespace,
+        question=search_q,
+        top_k=5,
+        rerank=True,
+    )
+    result = AgentResult(agent=spec, search_query=search_q, chunks=chunks)
+    return {"agent_results": [result]}
+
+
+def generate_response(state: GraphState) -> dict:
+    """Node: produce the final LLM answer from retrieved context."""
+    question = state["question"]
+    provider = state["provider"]
+    prior = state["prior_messages"]
+    agent_results: List[AgentResult] = state["agent_results"]
+    selected = state["selected_agents"]
+
+    if len(selected) == 1:
+        spec = selected[0]
+        scoped_question = f"Question about {spec.display_name}: {question}"
         user_prompt = build_user_prompt(
             scoped_question,
-            retrieval.chunks,
-            prior_messages=prior_messages or [],
+            agent_results[0].chunks if agent_results else [],
+            prior_messages=prior or [],
         )
-        response = generate(SYSTEM_PROMPT, user_prompt, provider=provider)
-        route = RouteDecision(
-            selected_agents=[self.spec],
-            used_default=False,
-            reason=f"Answered with single CV agent ({self.spec.display_name}).",
-        )
-        return OrchestrationResult(
-            response=response,
-            route=route,
-            agent_results=[retrieval],
-        )
-
-
-class ResponseSynthesizer:
-    """Combine multi-agent retrieval context into one grounded answer."""
-
-    _SYSTEM = (
-        "You are a CV comparison assistant. Use ONLY the retrieved CV context from "
-        "the listed people. Do not invent facts. If context is insufficient for any "
-        "part of the question, explicitly say the CVs do not contain that information. "
-        "For comparisons, mention each person separately before concluding. "
-        "Answer in the same language as the user's question."
-    )
-
-    @staticmethod
-    def _format_multi_context(agent_results: List[AgentResult]) -> str:
-        if not agent_results:
-            return "(no context retrieved)"
-
-        sections: List[str] = []
-        for result in agent_results:
-            person = result.agent.display_name
-            if not result.chunks:
-                sections.append(
-                    f"### {person}\n(no context retrieved for this CV)"
-                )
-                continue
-
-            chunk_lines: List[str] = []
-            for idx, chunk in enumerate(result.chunks, start=1):
-                chunk_lines.append(
-                    f"[{person}#{idx}] (source: {chunk.source}, chunk #{chunk.chunk_index}, "
-                    f"score={chunk.score:.3f})\n{chunk.content}"
-                )
-            sections.append(f"### {person}\n\n" + "\n\n".join(chunk_lines))
-        return "\n\n".join(sections)
-
-    def synthesize(
-        self,
-        question: str,
-        agent_results: List[AgentResult],
-        provider: str,
-        prior_messages: Optional[List[dict]] = None,
-    ) -> LLMResponse:
-        history_block = ""
-        if prior_messages:
-            recent = []
-            for message in prior_messages[-8:]:
-                role = message.get("role")
-                content = (message.get("content") or "").strip()
-                if role in ("user", "assistant") and content:
-                    label = "User" if role == "user" else "Assistant"
-                    recent.append(f"{label}: {content}")
-            if recent:
-                history_block = "=== PRIOR MESSAGES ===\n" + "\n\n".join(recent) + "\n\n"
-
-        context = self._format_multi_context(agent_results)
+        resp = generate(SYSTEM_PROMPT, user_prompt, provider=provider)
+    else:
+        context = _format_multi_context(agent_results)
+        history_block = _format_history_block(prior)
         user_prompt = (
             "Use the multi-person CV context to answer the question.\n\n"
             f"{history_block}"
@@ -282,68 +295,139 @@ class ResponseSynthesizer:
             "- If missing, say the CV(s) do not contain that information.\n"
             "- For comparisons, make the basis of comparison explicit.\n"
         )
-        return generate(self._SYSTEM, user_prompt, provider=provider)
+        resp = generate(_SYNTHESIZER_SYSTEM, user_prompt, provider=provider)
+
+    return {"response": resp}
 
 
-class MultiAgentOrchestrator:
-    """Router + per-agent retrieval + final synthesis pipeline."""
+# ---------------------------------------------------------------------------
+# Prompt helpers (extracted from the old ResponseSynthesizer)
+# ---------------------------------------------------------------------------
 
-    def __init__(
-        self,
-        store: PineconeStore,
-        registry: AgentRegistry,
-        synthesizer: Optional[ResponseSynthesizer] = None,
-    ) -> None:
-        self.store = store
-        self.registry = registry
-        self.router = CVRouter(registry)
-        self.synthesizer = synthesizer or ResponseSynthesizer()
+def _format_multi_context(agent_results: List[AgentResult]) -> str:
+    if not agent_results:
+        return "(no context retrieved)"
 
-    def answer(
-        self,
-        question: str,
-        provider: str,
-        prior_messages: Optional[List[dict]] = None,
-    ) -> OrchestrationResult:
-        route = self.router.route(question)
-        if not route.selected_agents:
-            empty_response = LLMResponse(
-                text="No CV agents are registered yet. Upload at least one CV to continue.",
-                provider=provider,
-                model="n/a",
+    sections: List[str] = []
+    for result in agent_results:
+        person = result.agent.display_name
+        if not result.chunks:
+            sections.append(f"### {person}\n(no context retrieved for this CV)")
+            continue
+
+        chunk_lines: List[str] = []
+        for idx, chunk in enumerate(result.chunks, start=1):
+            chunk_lines.append(
+                f"[{person}#{idx}] (source: {chunk.source}, chunk #{chunk.chunk_index}, "
+                f"score={chunk.score:.3f})\n{chunk.content}"
             )
-            return OrchestrationResult(
-                response=empty_response,
-                route=route,
-                agent_results=[],
-            )
+        sections.append(f"### {person}\n\n" + "\n\n".join(chunk_lines))
+    return "\n\n".join(sections)
 
-        if len(route.selected_agents) == 1:
-            single_agent = CVAgent(self.store, route.selected_agents[0])
-            result = single_agent.answer(
-                question=question,
-                provider=provider,
-                prior_messages=prior_messages,
-            )
-            return OrchestrationResult(
-                response=result.response,
-                route=route,
-                agent_results=result.agent_results,
-            )
 
-        agent_results: List[AgentResult] = []
-        for spec in route.selected_agents:
-            agent = CVAgent(self.store, spec)
-            agent_results.append(agent.retrieve(question, prior_messages=prior_messages))
+def _format_history_block(prior_messages: Optional[List[dict]]) -> str:
+    if not prior_messages:
+        return ""
+    recent = []
+    for message in prior_messages[-8:]:
+        role = message.get("role")
+        content = (message.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            label = "User" if role == "user" else "Assistant"
+            recent.append(f"{label}: {content}")
+    if not recent:
+        return ""
+    return "=== PRIOR MESSAGES ===\n" + "\n\n".join(recent) + "\n\n"
 
-        final_response = self.synthesizer.synthesize(
-            question=question,
-            agent_results=agent_results,
-            provider=provider,
-            prior_messages=prior_messages,
-        )
-        return OrchestrationResult(
-            response=final_response,
-            route=route,
-            agent_results=agent_results,
-        )
+
+# ---------------------------------------------------------------------------
+# Conditional edge functions
+# ---------------------------------------------------------------------------
+
+def _route_after_decision(state: GraphState) -> Any:
+    """Conditional edge from route_query.
+
+    Returns "no_agents_response" when no agents matched, or a list of
+    Send objects that fan-out one retrieve_cv call per selected agent.
+    """
+    selected = state.get("selected_agents") or []
+    if not selected:
+        return "no_agents_response"
+
+    return [
+        Send("retrieve_cv", {**state, "agent_spec": spec})
+        for spec in selected
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Graph builder
+# ---------------------------------------------------------------------------
+
+def build_graph() -> StateGraph:
+    """Construct and compile the multi-agent CV RAG graph."""
+    builder = StateGraph(GraphState)
+
+    builder.add_node("route_query", route_query)
+    builder.add_node("no_agents_response", no_agents_response)
+    builder.add_node("retrieve_cv", retrieve_cv)
+    builder.add_node("generate_response", generate_response)
+
+    builder.add_edge(START, "route_query")
+
+    builder.add_conditional_edges(
+        "route_query",
+        _route_after_decision,
+        ["no_agents_response", "retrieve_cv"],
+    )
+
+    builder.add_edge("retrieve_cv", "generate_response")
+    builder.add_edge("generate_response", END)
+    builder.add_edge("no_agents_response", END)
+
+    return builder.compile()
+
+
+# ---------------------------------------------------------------------------
+# Public convenience wrapper
+# ---------------------------------------------------------------------------
+
+_compiled_graph = None
+
+
+def _get_graph():
+    global _compiled_graph
+    if _compiled_graph is None:
+        _compiled_graph = build_graph()
+    return _compiled_graph
+
+
+def run_graph(
+    question: str,
+    provider: str,
+    prior_messages: List[dict],
+    store: PineconeStore,
+    registry: AgentRegistry,
+) -> OrchestrationResult:
+    """Run the LangGraph multi-agent pipeline and return an OrchestrationResult."""
+    graph = _get_graph()
+
+    initial_state: GraphState = {
+        "question": question,
+        "provider": provider,
+        "prior_messages": prior_messages or [],
+        "store": store,
+        "registry": registry,
+        "selected_agents": [],
+        "route_decision": None,
+        "agent_results": [],
+        "response": None,
+    }
+
+    final_state = graph.invoke(initial_state)
+
+    return OrchestrationResult(
+        response=final_state["response"],
+        route=final_state["route_decision"],
+        agent_results=final_state["agent_results"],
+    )

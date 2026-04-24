@@ -197,16 +197,14 @@ class GraphState(TypedDict):
 
 
 class RetrieveInput(TypedDict):
-    """Per-branch state sent to retrieve_cv via Send."""
+    """Per-branch state sent to retrieve_cv via Send.
+
+    Only carries the fields retrieve_cv actually needs so the fan-out
+    branches don't conflict on the reducer-managed agent_results channel.
+    """
     question: str
-    provider: str
     prior_messages: List[dict]
     store: Any
-    registry: Any
-    selected_agents: List[AgentSpec]
-    route_decision: Optional[RouteDecision]
-    agent_results: Annotated[List[AgentResult], operator.add]
-    response: Optional[LLMResponse]
     agent_spec: AgentSpec
 
 
@@ -355,7 +353,12 @@ def _route_after_decision(state: GraphState) -> Any:
         return "no_agents_response"
 
     return [
-        Send("retrieve_cv", {**state, "agent_spec": spec})
+        Send("retrieve_cv", {
+            "question": state["question"],
+            "prior_messages": state["prior_messages"],
+            "store": state["store"],
+            "agent_spec": spec,
+        })
         for spec in selected
     ]
 

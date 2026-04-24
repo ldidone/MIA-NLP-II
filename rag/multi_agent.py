@@ -274,6 +274,11 @@ def retrieve_cv(state: RetrieveInput) -> dict:
     return {"agent_results": [result]}
 
 
+def collect_results(state: GraphState) -> dict:
+    """Fan-in node: no-op that waits for all retrieve_cv branches to finish."""
+    return {}
+
+
 def generate_response(state: GraphState) -> dict:
     """Node: produce the final LLM answer from retrieved context."""
     question = state["question"]
@@ -389,6 +394,7 @@ def build_graph() -> StateGraph:
     builder.add_node("route_query", route_query)
     builder.add_node("no_agents_response", no_agents_response)
     builder.add_node("retrieve_cv", retrieve_cv)
+    builder.add_node("collect_results", collect_results)
     builder.add_node("generate_response", generate_response)
 
     builder.add_edge(START, "route_query")
@@ -399,7 +405,8 @@ def build_graph() -> StateGraph:
         ["no_agents_response", "retrieve_cv"],
     )
 
-    builder.add_edge("retrieve_cv", "generate_response")
+    builder.add_edge("retrieve_cv", "collect_results")
+    builder.add_edge("collect_results", "generate_response")
     builder.add_edge("generate_response", END)
     builder.add_edge("no_agents_response", END)
 

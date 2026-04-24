@@ -20,6 +20,13 @@ from .prompts import SYSTEM_PROMPT, build_search_query, build_user_prompt
 # Domain data classes (unchanged)
 # ---------------------------------------------------------------------------
 
+def _normalize(text: str) -> str:
+    """Lowercase and strip combining accents for robust name matching."""
+    import unicodedata
+    nfkd = unicodedata.normalize("NFKD", text.lower())
+    return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+
+
 def _slugify(value: str) -> str:
     normalized = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().lower())
     normalized = re.sub(r"_+", "_", normalized).strip("_")
@@ -131,13 +138,16 @@ class AgentRegistry:
         self._default_agent_id = person_id
 
     def find_agents_in_query(self, query: str) -> List[AgentSpec]:
-        text = query.lower()
+        text = _normalize(query)
         matched: List[AgentSpec] = []
 
         for agent in self._agents_by_id.values():
             for alias in agent.aliases:
-                escaped = re.escape(alias.lower())
-                pattern = rf"\b{escaped}\b"
+                norm_alias = _normalize(alias)
+                if len(norm_alias) < 2:
+                    continue
+                escaped = re.escape(norm_alias)
+                pattern = rf"(?<![a-z0-9]){escaped}(?![a-z0-9])"
                 if re.search(pattern, text):
                     matched.append(agent)
                     break
@@ -251,12 +261,15 @@ def retrieve_cv(state: RetrieveInput) -> dict:
     prior = state["prior_messages"]
 
     search_q = build_search_query(question, prior or [])
-    chunks = store.search(
-        namespace=spec.namespace,
-        question=search_q,
-        top_k=5,
-        rerank=True,
-    )
+    try:
+        chunks = store.search(
+            namespace=spec.namespace,
+            question=search_q,
+            top_k=5,
+            rerank=True,
+        )
+    except Exception:
+        chunks = []
     result = AgentResult(agent=spec, search_query=search_q, chunks=chunks)
     return {"agent_results": [result]}
 
@@ -266,15 +279,17 @@ def generate_response(state: GraphState) -> dict:
     question = state["question"]
     provider = state["provider"]
     prior = state["prior_messages"]
-    agent_results: List[AgentResult] = state["agent_results"]
-    selected = state["selected_agents"]
+    agent_results: List[AgentResult] = state.get("agent_results") or []
+    selected = state.get("selected_agents") or []
 
-    if len(selected) == 1:
-        spec = selected[0]
-        scoped_question = f"Question about {spec.display_name}: {question}"
+    if len(selected) <= 1:
+        spec = selected[0] if selected else None
+        name = spec.display_name if spec else "the candidate"
+        chunks = agent_results[0].chunks if agent_results else []
+        scoped_question = f"Question about {name}: {question}"
         user_prompt = build_user_prompt(
             scoped_question,
-            agent_results[0].chunks if agent_results else [],
+            chunks,
             prior_messages=prior or [],
         )
         resp = generate(SYSTEM_PROMPT, user_prompt, provider=provider)

@@ -17,8 +17,13 @@ from rag.llm import (
     generate,
 )
 from rag.loader import SUPPORTED_EXTENSIONS, UnsupportedFileTypeError, extract_text
-from rag.pinecone_store import PineconeStore, RetrievedChunk, namespace_for
-from rag.prompts import SYSTEM_PROMPT, build_user_prompt
+from rag.pinecone_store import (
+    PineconeStore,
+    PineconeUnauthorized,
+    RetrievedChunk,
+    namespace_for,
+)
+from rag.prompts import SYSTEM_PROMPT, build_search_query, build_user_prompt
 
 
 load_dotenv()
@@ -50,7 +55,7 @@ def _ingest_cv(store: PineconeStore, file_bytes: bytes, filename: str) -> None:
         st.error("Could not extract any text from the uploaded file.")
         return
 
-    chunks = chunk_text(text, size=800, overlap=100)
+    chunks = chunk_text(text)
     if not chunks:
         st.error("The CV produced no chunks after splitting.")
         return
@@ -63,8 +68,16 @@ def _ingest_cv(store: PineconeStore, file_bytes: bytes, filename: str) -> None:
             "Skipping re-upload."
         )
     else:
-        with st.spinner(f"Indexing {len(chunks)} chunks into Pinecone..."):
-            store.upsert_chunks(namespace, chunks, source=filename)
+        try:
+            with st.spinner(f"Indexing {len(chunks)} chunks into Pinecone..."):
+                store.upsert_chunks(namespace, chunks, source=filename)
+        except PineconeUnauthorized:
+            st.error(
+                "Pinecone returned 401 Unauthorized. The index was likely deleted "
+                "while the app was running. Click **Reconnect to Pinecone** in the "
+                "sidebar, then re-upload the CV."
+            )
+            return
 
     st.session_state.namespace = namespace
     st.session_state.cv_filename = filename
@@ -132,6 +145,21 @@ def _render_sidebar(store: PineconeStore) -> str:
             st.session_state.messages = []
             st.rerun()
 
+        st.divider()
+        if st.button(
+            "Reconnect to Pinecone",
+            use_container_width=True,
+            help="Use this if you deleted or recreated the Pinecone index while "
+            "the app was running.",
+        ):
+            get_store.clear()
+            st.session_state.namespace = None
+            st.session_state.cv_filename = None
+            st.session_state.num_chunks = 0
+            st.session_state.uploaded_hash = None
+            st.session_state.messages = []
+            st.rerun()
+
         return provider
 
 
@@ -165,11 +193,20 @@ def _answer(store: PineconeStore, provider: str, question: str) -> None:
         st.warning("Upload a CV before asking questions.")
         return
 
+    prior = st.session_state.messages[:-1]
     with st.chat_message("assistant"):
-        with st.spinner("Searching CV..."):
-            chunks = store.search(namespace, question, top_k=5, rerank=True)
+        try:
+            with st.spinner("Searching CV..."):
+                search_q = build_search_query(question, prior)
+                chunks = store.search(namespace, search_q, top_k=5, rerank=True)
+        except PineconeUnauthorized:
+            st.error(
+                "Pinecone returned 401 Unauthorized. The index may have been "
+                "deleted. Click **Reconnect to Pinecone** in the sidebar."
+            )
+            return
 
-        user_prompt = build_user_prompt(question, chunks)
+        user_prompt = build_user_prompt(question, chunks, prior_messages=prior)
 
         try:
             with st.spinner("Generating answer..."):

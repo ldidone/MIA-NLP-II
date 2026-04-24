@@ -10,6 +10,7 @@ from typing import Iterable, List, Optional
 
 from dotenv import load_dotenv
 from pinecone import Pinecone
+from pinecone.exceptions import UnauthorizedException as PineconeUnauthorized
 
 load_dotenv()
 
@@ -56,6 +57,15 @@ class PineconeStore:
         self._ensure_index()
         self.index = self.pc.Index(self.index_name)
 
+    def reconnect(self) -> None:
+        """Re-create the index if missing and refresh the Index handle.
+
+        Call this after the Pinecone index has been deleted externally so the
+        cached PineconeStore object picks up the new host URL.
+        """
+        self._ensure_index()
+        self.index = self.pc.Index(self.index_name)
+
     def _ensure_index(self) -> None:
         if self.pc.has_index(self.index_name):
             return
@@ -77,6 +87,14 @@ class PineconeStore:
             f"Pinecone index {self.index_name!r} did not become ready in "
             f"{INDEX_READY_TIMEOUT_S}s."
         )
+
+    def _with_reconnect(self, fn):
+        """Call `fn()`, reconnecting once if a stale-index 401 is raised."""
+        try:
+            return fn()
+        except PineconeUnauthorized:
+            self.reconnect()
+            return fn()
 
     def namespace_exists(self, namespace: str) -> bool:
         try:
@@ -117,8 +135,11 @@ class PineconeStore:
             for i, chunk in enumerate(chunks)
         ]
 
-        for batch in _batched(records, TEXT_BATCH_LIMIT):
-            self.index.upsert_records(namespace, batch)
+        def _do_upsert() -> None:
+            for batch in _batched(records, TEXT_BATCH_LIMIT):
+                self.index.upsert_records(namespace, batch)
+
+        self._with_reconnect(_do_upsert)
 
         if wait_for_indexing:
             time.sleep(10)
@@ -149,7 +170,7 @@ class PineconeStore:
                 "rank_fields": [TEXT_FIELD],
             }
 
-        results = self.index.search(**kwargs)
+        results = self._with_reconnect(lambda: self.index.search(**kwargs))
         hits = results["result"]["hits"]
 
         retrieved: List[RetrievedChunk] = []

@@ -75,5 +75,18 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
 
 def _normalize_whitespace(text: str) -> str:
     lines = [line.strip() for line in text.splitlines()]
-    cleaned = "\n".join(line for line in lines if line)
-    return cleaned.strip()
+    # Preserve single blank lines as paragraph separators; collapse runs.
+    result: list[str] = []
+    prev_blank = False
+    for line in lines:
+        is_blank = not line
+        if is_blank and prev_blank:
+            continue  # collapse consecutive blank lines
+        result.append(line)
+        prev_blank = is_blank
+    # Strip leading/trailing blank lines
+    while result and not result[0]:
+        result.pop(0)
+    while result and not result[-1]:
+        result.pop()
+    return "\n".join(result)
